@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenv
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Training artifacts
+checkpoints/
+ckpts/
+outputs/
+logs/
+runs/
+wandb/
+*.log
+*.out
+*.err
+
+# 数据 / 大文件（按需放行）
+data/
+datasets/
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# Profiling
+*.json.gz
+*.qdrep
+*.nsys-rep
+*.sqlite
+trace_*.json
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Env files
+.env
+.env.local
