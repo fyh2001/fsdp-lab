@@ -80,7 +80,7 @@ File ".../accelerate/utils/dataclasses.py", line 2059, in __post_init__
 
 `accelerate` 在找 `Gemma4AudioLayer` class，但 model 里没有。`TRANSFORMER_BASED_WRAP` 默认从 `model._no_split_modules` 拿 layer 名字列表。
 
-[transformers/src/transformers/models/gemma4/modeling_gemma4.py#L1443](https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma4/modeling_gemma4.py#L1443)
+> [transformers/src/transformers/models/gemma4/modeling_gemma4.py#L1443](https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma4/modeling_gemma4.py#L1443)
 ```Python
 @auto_docstring
 class Gemma4PreTrainedModel(PreTrainedModel):
@@ -89,7 +89,7 @@ class Gemma4PreTrainedModel(PreTrainedModel):
     ...
 ```
 
-会看到列表里硬编码了 `["Gemma4TextDecoderLayer", "Gemma4VisionEncoderLayer", "Gemma4AudioLayer"]`——这是 transformers 给整个 gemma4 family 用的"超集"。但 `gemma-4-26B-A4B` 实例里**没有装 audio encoder**（gemma4 family 里只有 E2B/E4B 边缘多模态版才带 audio；A4B 是 MoE text+vision 版）。
+会看到列表里硬编码了 `["Gemma4TextDecoderLayer", "Gemma4VisionEncoderLayer", "Gemma4AudioLayer"]` ——这是 transformers 给整个 gemma4 family 用的"超集"。但 `gemma-4-26B-A4B` 实例里**没有装 audio encoder**（gemma4 family 里只有 E2B/E4B 边缘多模态版才带 audio；A4B 是 MoE text+vision 版）。
 
 通过下列方式验证：
 ```Bash
@@ -423,9 +423,8 @@ def _prepare_flash_attn(self, base_model: torch.nn.Module):
                     attention_mask = attention_mask,
                     **kwargs
                 )
-            attention_mask = kwargs.get('attention_mask')
             if attention_mask is not None and attention_mask.all(): 
-                    attention_mask = None
+                attention_mask = None
             return attention_mask
 ```
 
@@ -479,7 +478,7 @@ class Gemma4TextAttention(nn.Module):
             if _impl in FA_IMPLS and self.head_dim > 256:
                 _impl = "sdpa"
             
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+            attention_interface = ALL_ATTENTION_FUNCTIONS[_impl]
 ```
 
 但是这种做法，想要用 transformers 新的改动，可能会存在冲突，需手动解决 rebase 冲突，维护不友好。这里我选择用打 patch 的方式适配:
@@ -500,7 +499,8 @@ def _fa_supports_head_dim_512() -> bool:
     Check if the flash attention library supports head dimension 512.
     """
     try:
-        import flash_attn from packaging.version import Version
+        import flash_attn 
+        from packaging.version import Version
     except Exception:
         return False
 
@@ -513,7 +513,7 @@ def _fa_supports_head_dim_512() -> bool:
 def apply(force: bool = False) -> bool:
     try:
         import transformers
-        from tranformers.models.gemma4 import modeling_gemma4
+        from transformers.models.gemma4 import modeling_gemma4
         from transformers.models.gemma4.modeling_gemma4 import (
             Gemma4ForConditionalGeneration,
             Gemma4TextAttention,
@@ -568,7 +568,6 @@ class Gemma4Loader(ModelLoader):
         from transformers import Gemma4ForConditionalGeneration
 
         # apply patch
-        Gemma4ForConditionalGeneration._support_flash_attn = True
         from swift.utils.patches.gemma4_fa_patch import apply as _patch_gemma4_attention
         _patch_gemma4_attention()
 
