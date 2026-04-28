@@ -3,7 +3,7 @@
 ## 元信息
 
 - **模型**：Gemma4-26B-A4B-it（VLM，文本-only SFT）
-- **日期**：2026-04-28（开跑时填）
+- **日期**：2026-04-28
 - **状态**：🔬 进行中 / ✅ 已结论 / ⏸️ 暂搁
 - **硬件**：8×H100-80GB（NVLink）
 - **框架**：FSDP2 + ms-swift / transformers
@@ -290,3 +290,15 @@ def fsdp2_prepare_model(accelerator, model: torch.nn.Module) -> torch.nn.Module:
 true 时 rank 0 在 CPU 上装满 model 然后 broadcast；root params 没被 shard 的话广播完后还是 plain Tensor → accelerate 把 root 都当 DTensor 处理就崩。
 
 代价：每 rank 自己 load 51.6 GB 模型（主机 RAM 峰值 ≈ 400 GB），加载 ~30 sec → ~90 sec。
+
+### swift SP 跟 transformers 5.5.x mask API mismatch 
+
+forward 第一步建 mask 时崩溃：
+```Bash
+File ".../transformers/models/gemma4/modeling_gemma4.py", line 2063, in create_causal_mask_mapping
+    "full_attention": create_causal_mask(**mask_kwargs),
+File ".../transformers/masking_utils.py", line 983, in create_causal_mask
+    causal_mask = mask_interface(...)
+TypeError: SequenceParallel._prepare_flash_attn.<locals>.flash_attention_mask()
+    missing 1 required positional argument: 'cache_position'
+```
