@@ -10,7 +10,7 @@
 
 ## 目标
 
-让 Gemma4-26B-A4B-it在 swift-ms sft FSDP2 上跑起来
+让 Gemma4-26B-A4B-it 在 swift-ms sft FSDP2 上跑起来
 
 ## 原始启动参数
 ``` Bash
@@ -20,7 +20,7 @@ NPROC_PER_NODE=8 swift sft \
     --model google/gemma-4-26B-A4B-it \
     --model_type gemma4 --template gemma4 \
     --dataset /home/ubuntu/fyh/megatron-sft-recipes/sft-data/train.jsonl \
-    --max_length 16384 --truncation_strategy delete \
+    --max_length 16384 --truncation_strategy right \
     --per_device_train_batch_size 1 --gradient_accumulation_steps 1 \
     --max_steps 5 --logging_steps 1 --save_strategy no \
     --tuner_type full --torch_dtype bfloat16 \
@@ -35,7 +35,7 @@ NPROC_PER_NODE=8 swift sft \
 ```
 
 ```Bash
-docker exec fsdp_sft bash -lc 'cat > /tmp/fsdp_q1.json' <<EOF
+docker exec fsdp_sft bash -lc 'cat > /tmp/fsdp_q1.json <<EOF
 {
     "fsdp": "full_shard auto_wrap",
     "fsdp_config": {
@@ -43,12 +43,31 @@ docker exec fsdp_sft bash -lc 'cat > /tmp/fsdp_q1.json' <<EOF
         "reshard_after_forward": true,
         "auto_wrap_policy": "TRANSFORMER_BASED_WRAP",
         "transformer_layer_cls_to_wrap": ["Gemma4TextDecoderLayer", "Gemma4VisionEncoderLayer"],
-        "cpu_ram_efficient_loading": true,
+        "cpu_ram_efficient_loading": false,
         "state_dict_type": "SHARDED_STATE_DICT",
         "activation_checkpointing": true
     }
 }
 EOF'
+
+docker exec fsdp_sft bash -lc "
+cd /home/ubuntu/fyh/megatron-sft-recipes && \
+NPROC_PER_NODE=8 swift sft \
+    --model google/gemma-4-26B-A4B-it \
+    --model_type gemma4 --template gemma4 \
+    --dataset /home/ubuntu/fyh/megatron-sft-recipes/sft-data/train.jsonl \
+    --max_length 16384 --truncation_strategy right \
+    --per_device_train_batch_size 1 --gradient_accumulation_steps 1 \
+    --max_steps 5 --logging_steps 1 --save_strategy no \
+    --tuner_type full --torch_dtype bfloat16 \
+    --attn_impl flash_attention_2 \
+    --freeze_vit true --freeze_aligner true \
+    --learning_rate 2e-5 --warmup_ratio 0.05 \
+    --use_liger_kernel true \
+    --fsdp /tmp/fsdp_q1.json \
+    --sequence_parallel_size 2 \
+    --output_dir /tmp/q1_run
+"
 ```
 
 ## 问题
@@ -291,7 +310,7 @@ true 时 rank 0 在 CPU 上装满 model 然后 broadcast；root params 没被 sh
 
 代价：每 rank 自己 load 51.6 GB 模型（主机 RAM 峰值 ≈ 400 GB），加载 ~30 sec → ~90 sec。
 
-### swift SP 跟 transformers 5.5.x mask API mismatch 
+### 3. swift SP 跟 transformers 5.5.x mask API mismatch 
 
 forward 第一步建 mask 时崩溃：
 ```Bash
@@ -301,4 +320,264 @@ File ".../transformers/masking_utils.py", line 983, in create_causal_mask
     causal_mask = mask_interface(...)
 TypeError: SequenceParallel._prepare_flash_attn.<locals>.flash_attention_mask()
     missing 1 required positional argument: 'cache_position'
+```
+
+对应的源码如下：
+
+ms-swift：[ms-swift/swift/sequence_parallel/ulysses.py#L185](https://github.com/modelscope/ms-swift/blob/main/swift/sequence_parallel/ulysses.py#L185)
+```Python
+class SequenceParallel:
+    ...
+    def _prepare_flash_attn(self, base_model: torch.nn.Module):
+        try:
+            from transformers import masking_utils
+
+            _origin_flash_attention_mask = masking_utils.flash_attention_mask
+
+            def flash_attention_mask(*args, **kwargs):
+                if self.world_size == 1:
+                    return _origin_flash_attention_mask(*args, **kwargs)
+                attention_mask = kwargs.get('attention_mask')
+                if attention_mask is not None:
+                    if attention_mask.all():
+                        attention_mask = None
+
+                return attention_mask
+    ...
+```
+
+transformers：[transformers/src/transformers/masking_utils.py#L983C5-L997C23](https://github.com/huggingface/transformers/blob/v5.5-release/src/transformers/masking_utils.py#L983C5-L997C23)
+```Python
+@deprecate_kwarg("input_embeds", version="5.6.0", new_name="inputs_embeds")
+def create_causal_mask( config: PreTrainedConfig,
+    inputs_embeds: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    cache_position: torch.Tensor | None = None, 
+    past_key_values: Cache | None,
+    position_ids: torch.Tensor | None = None,
+    or_mask_function: Callable | None = None,
+    and_mask_function: Callable | None = None,
+):
+    ...
+    # v5.1.x
+    causal_mask = mask_interface(
+        batch_size=batch_size,
+        cache_position=cache_position,
+        kv_length=kv_length,
+        kv_offset=kv_offset,
+        mask_function=mask_factory_function,
+        attention_mask=attention_mask,
+        allow_is_causal_skip=allow_is_causal_skip,
+        dtype=dtype, 
+        config=config, 
+        use_vmap=use_vmap,
+    )
+
+    # v5.5.x
+    causal_mask = mask_interface(
+        batch_size=batch_size,
+        q_length=q_length,
+        kv_length=kv_length,
+        q_offset=q_offset,
+        kv_offset=kv_offset,
+        mask_function=mask_factory_function,
+        attention_mask=attention_mask,
+        allow_is_causal_skip=allow_is_causal_skip,
+        dtype=dtype, 
+        config=config,  
+        use_vmap=use_vmap,
+        device=device,
+    )
+
+    return causal_mask
+```
+
+很明显 `transformers v5.5.x`中，`mask_interface()` 的参数 `cache_position` 改为了 `q_length`和 `q_offset`。所以我们也得在 ms-swift 中相应位置进行兼容：
+
+```Python
+# ms-swift/swift/sequence_parallel/ulysses.py
+def _prepare_flash_attn(self, base_model: torch.nn.Module):
+    try:
+        from transformers import masking_utils
+
+        _origin_flash_attention_mask = masking_utils.flash_attention_mask
+
+        def flash_attention_mask(
+            batch_size,
+            q_length,
+            kv_length,
+            q_offset,
+            kv_offset,
+            mask_function = masking_utils.causal_mask_function,
+            attention_mask = None,
+            **kwargs
+        ):
+            if self.world_size == 1:
+                return _origin_flash_attention_mask(
+                    batch_size = batch_size,
+                    q_length = q_length,
+                    kv_length = kv_length,
+                    q_offset = q_offset,
+                    kv_offset = kv_offset,
+                    mask_function = mask_function,
+                    attention_mask = attention_mask,
+                    **kwargs
+                )
+            attention_mask = kwargs.get('attention_mask')
+            if attention_mask is not None and attention_mask.all(): 
+                    attention_mask = None
+            return attention_mask
+```
+
+### 4. FA2 不支持 `head_dim=512`
+```Bash
+RuntimeError: FlashAttention forward only supports head dimension at most 256
+File "/usr/local/lib/python3.12/site-packages/flash_attn/flash_attn_interface.py", line 91, in _flash_attn_forward
+    out, softmax_lse, S_dmask, rng_state = flash_attn_gpu.fwd(
+                                           ^^^^^^^^^^^^^^^^^^
+```
+
+transformers：[transformers/src/transformers/models/gemma4/configuration_gemma4.py#L151](https://github.com/huggingface/transformers/blob/v5.5-release/src/transformers/models/gemma4/configuration_gemma4.py#L151)
+```Python
+@auto_docstring(checkpoint="google/gemma-4-e2b-it")
+@strict
+class Gemma4TextConfig(PreTrainedConfig):
+    ...
+    head_dim: int = 256
+    ...
+    num_global_key_value_heads: int | None = None
+    global_head_dim: int = 512
+```
+从 configuration 可以看出：
+- `head_dim`（默认 256）→ 用在 **sliding_attention** 层
+- `global_head_dim`（默认 512）→ 用在 **full_attention**（global）层
+- `num_global_key_value_heads`（默认与 `num_key_value_heads` 相同）→ global 层的 KV 头数可以独立设
+
+而截至 2026-04-28，FA2 max=256, FA3 max=256，所以 `--attn_impl flash_attention_2` 全用 FA2 → global 层炸。
+
+我们可以修改 `transformers` 中 Gemma4 这部分代码，跳过识别到 `head_dim` > 256 就 fallback 到 sdpa
+
+> [transformers/src/transformers/models/gemma4/modeling_gemma4.py#L1228](https://github.com/huggingface/transformers/blob/v5.5-release/src/transformers/models/gemma4/modeling_gemma4.py#L1228)
+
+```Python
+@use_kernelized_func(apply_rotary_pos_emb)
+class Gemma4TextAttention(nn.Module):
+    ...
+    def forward(self, ...) -> tuple[torch.Tensor, torch.Tensor | None]:
+        ...
+        # 源码
+        attention_interface: Callable = eager_attention_forward
+        if self.config._attn_implementation != "eager":
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+        # 调整
+        attention_interface: Callable = eager_attention_forward
+        if self.config._attn_implementation != "eager":
+            FA_IMPLS = {"flash_attention_2", "flash_attention_3", "flash_attention_3_kernels"}
+
+            _impl = self.config._attn_implementation
+            if _impl in FA_IMPLS and self.head_dim > 256:
+                _impl = "sdpa"
+            
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+```
+
+但是这种做法，想要用 transformers 新的改动，可能会存在冲突，需手动解决 rebase 冲突，维护不友好。这里我选择用打 patch 的方式适配:
+
+```Python
+# ms-swift/swift/utils/patches/gemma4_fa_patch.py
+from __future__ import annotations
+
+import logging
+import os
+
+logger = logging.getLogger(__name__)
+
+_PATCH_FLAG = "_patched_gemma4_fa_attention"
+
+def _fa_supports_head_dim_512() -> bool:
+    """
+    Check if the flash attention library supports head dimension 512.
+    """
+    try:
+        import flash_attn from packaging.version import Version
+    except Exception:
+        return False
+
+    fa_512_min_version = os.environ.get("FA_HEAD_DIM_512_MIN_VERSION", "99.99.99")
+    try:
+        return Version(flash_attn.__version__) >= Version(fa_512_min_version)
+    except Exception:
+        return False
+
+def apply(force: bool = False) -> bool:
+    try:
+        import transformers
+        from tranformers.models.gemma4 import modeling_gemma4
+        from transformers.models.gemma4.modeling_gemma4 import (
+            Gemma4ForConditionalGeneration,
+            Gemma4TextAttention,
+        )
+
+    except Exception as e:
+        logger.warning(f"[gemma4_fa_patch] transformers/Gemma4 not importable, skip: {e}")
+        return False
+
+    if getattr(Gemma4TextAttention, _PATCH_FLAG, False):
+        return True
+
+    if not force and _fa_supports_head_dim_512():
+        logger.info("[gemma4_fa_patch] flash_attn already supports head_dim=512, skip patch")
+        return False
+
+    Gemma4ForConditionalGeneration._support_flash_attn = True
+
+    _origin_forward = Gemma4TextAttention.forward
+
+    def _patched_forward(self, *args, **kwargs):
+        _impl = getattr(self.config, "_attn_implementation", None)
+        if (
+            _impl in ("flash_attention_2", "flash_attention_3") and
+            getattr(self, "layer_type", None) == "full_attention"
+        ):
+            self.config._attn_implementation = "sdpa"
+            try:
+                return _origin_forward(self, *args, **kwargs)
+            finally:
+                self.config._attn_implementation = _impl
+        return _origin_forward(self, *args, **kwargs)
+
+    Gemma4TextAttention.forward = _patched_forward
+    setattr(Gemma4TextAttention, _PATCH_FLAG, True)
+
+    logger.info(
+        f"[gemma4_fa_patch] applied (transformers={transformers.__version__}); "
+        f"full_attention layers will fall back to SDPA when FA2/FA3 is requested"
+    )
+    return True
+
+
+if os.environ.get("GEMMA4_FA_PATCH_AUTO", "0") == "1":
+    apply()
+```
+
+在 `ms-swift/swift/model/models/gemma.py` 运用一下
+```Python
+class Gemma4Loader(ModelLoader):
+    def get_model(self, model_dir: str, *args, **kwargs) -> PreTrainedModel:
+        from transformers import Gemma4ForConditionalGeneration
+
+        # apply patch
+        Gemma4ForConditionalGeneration._support_flash_attn = True
+        from swift.utils.patches.gemma4_fa_patch import apply as _patch_gemma4_attention
+        _patch_gemma4_attention()
+
+        self.auto_model_cls = self.auto_model_cls or Gemma4ForConditionalGeneration
+        return super().get_model(model_dir, *args, **kwargs)
+```
+
+再通过 `docker cp` 拷进容器 + editable 安装即可
+```Bash
+docker cp /home/ubuntu/fyh/ms-swift fsdp_sft:/opt/ms-swift
+docker exec fsdp_sft bash -lc "pip install -e /opt/ms-swift --no-deps"
 ```
